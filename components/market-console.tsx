@@ -7,6 +7,7 @@ import { MarketReport } from "@/components/market-report"
 import { ThinkingStage } from "@/components/thinking-stage"
 import { TurnstileWidget } from "@/components/turnstile-widget"
 import { Button } from "@/components/ui/button"
+import { buildAiFacts } from "@/lib/analysis/reliable-report"
 import { canStartAnalysis, findCachedResult, registerAnalysisAttempt, requestCacheKey, saveResult } from "@/lib/client/history"
 import { readNdjson } from "@/lib/client/stream"
 import { COUNTRIES, SALARY_CURRENCIES, countryByCode, countryByInput } from "@/lib/domain/countries"
@@ -20,14 +21,21 @@ import {
   type JobSearch,
   type SearchRequest,
 } from "@/lib/domain/search-schema"
-import type { AnalysisStatus, StreamEvent } from "@/lib/domain/stream-event"
+import type { AnalysisMode, AnalysisStatus, StreamEvent } from "@/lib/domain/stream-event"
 
 const FIELD_CLASS = "mt-2 w-full rounded-lg border border-input bg-background px-3.5 py-2.5 text-sm outline-none focus:ring-2 focus:ring-ring/40"
 const LABEL_CLASS = "font-mono text-[11px] uppercase tracking-[0.16em] text-muted-foreground"
 const LEVEL_LABELS = { any: "Любой", junior: "Junior", middle: "Middle", senior: "Senior", lead: "Lead" }
 const WORK_LABELS = { any: "Любой", remote: "Удалённо", hybrid: "Гибрид", onsite: "Офис" }
 
-type ResultState = { jobs: JobWithSalaryGroup[]; report?: MarketReportData; warning?: string; cached?: boolean }
+type RequestWithoutToken = Omit<SearchRequest, "turnstileToken">
+type ResultState = {
+  jobs: JobWithSalaryGroup[]
+  report?: MarketReportData
+  mode?: AnalysisMode
+  warning?: string
+  cached?: boolean
+}
 
 function splitSkills(value: string) {
   return Array.from(new Set(value.split(/[,;\n]/).map((skill) => skill.trim().toLowerCase()).filter(Boolean)))
@@ -52,6 +60,8 @@ export function MarketConsole() {
   const [statusMessage, setStatusMessage] = useState("")
   const [error, setError] = useState("")
   const [result, setResult] = useState<ResultState | null>(null)
+  const [lastRequest, setLastRequest] = useState<RequestWithoutToken | null>(null)
+  const [retryingAi, setRetryingAi] = useState(false)
 
   const handleTurnstileToken = useCallback((token: string) => setTurnstileToken(token), [])
 
@@ -92,11 +102,12 @@ export function MarketConsole() {
         salaryCurrency,
       },
       profile: { level: profileLevel, yearsExperience: Number(yearsExperience), skills: normalizedSkills },
-    } satisfies Omit<SearchRequest, "turnstileToken">
+    } satisfies RequestWithoutToken
+    setLastRequest(requestWithoutToken)
     const cacheKey = requestCacheKey(requestWithoutToken)
     const cached = findCachedResult(localStorage, cacheKey)
     if (cached) {
-      setResult({ jobs: cached.jobs, report: cached.report, warning: cached.warning, cached: true })
+      setResult({ jobs: cached.jobs, report: cached.report, mode: cached.mode, warning: cached.warning, cached: true })
       return
     }
 
@@ -117,6 +128,7 @@ export function MarketConsole() {
 
     let streamedJobs: JobWithSalaryGroup[] = []
     let streamedReport: MarketReportData | undefined
+    let streamedMode: AnalysisMode | undefined
     let streamedWarning: string | undefined
 
     try {
@@ -140,10 +152,12 @@ export function MarketConsole() {
           setResult({ jobs: streamedJobs })
         } else if (streamEvent.type === "analysis") {
           streamedReport = streamEvent.report
-          setResult({ jobs: streamedJobs, report: streamedReport, warning: streamedWarning })
+          streamedMode = streamEvent.mode
+          if (streamedMode === "ai") streamedWarning = undefined
+          setResult({ jobs: streamedJobs, report: streamedReport, mode: streamedMode, warning: streamedWarning })
         } else if (streamEvent.type === "warning") {
           streamedWarning = streamEvent.message
-          setResult({ jobs: streamedJobs, report: streamedReport, warning: streamedWarning })
+          setResult({ jobs: streamedJobs, report: streamedReport, mode: streamedMode, warning: streamedWarning })
         } else if (streamEvent.type === "error") {
           setError(streamEvent.message)
         }
@@ -155,12 +169,57 @@ export function MarketConsole() {
           createdAt: Date.now(),
           jobs: streamedJobs,
           report: streamedReport,
+          mode: streamedMode,
           warning: streamedWarning,
         })
       }
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Не удалось выполнить поиск")
     } finally {
+      setStatus(null)
+    }
+  }
+
+  async function handleRetryAi() {
+    if (!result?.report || result.mode !== "fallback" || !lastRequest || retryingAi) return
+    setError("")
+    if (!turnstileToken) {
+      setError("Завершите проверку безопасности, затем повторите AI-анализ.")
+      return
+    }
+
+    const token = turnstileToken
+    const facts = buildAiFacts(result.jobs, lastRequest.search, lastRequest.profile)
+    const cacheKey = requestCacheKey(lastRequest)
+    setRetryingAi(true)
+    setStatus("analyzing")
+    setStatusMessage("Повторяем только AI-анализ — вакансии заново не ищем")
+    setTurnstileToken("")
+    setTurnstileVersion((version) => version + 1)
+
+    try {
+      const response = await fetch("/api/analyze/retry", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ facts, turnstileToken: token }),
+      })
+      const body = await response.json().catch(() => null) as { error?: string; report?: MarketReportData } | null
+      if (!response.ok || !body?.report) throw new Error(body?.error ?? "Не удалось повторить AI-анализ")
+
+      const nextResult: ResultState = { ...result, report: body.report, mode: "ai", warning: undefined, cached: false }
+      setResult(nextResult)
+      saveResult(localStorage, {
+        key: cacheKey,
+        createdAt: Date.now(),
+        jobs: nextResult.jobs,
+        report: nextResult.report,
+        mode: nextResult.mode,
+      })
+    } catch (requestError) {
+      const message = requestError instanceof Error ? requestError.message : "Не удалось повторить AI-анализ"
+      setResult((current) => current ? { ...current, warning: message } : current)
+    } finally {
+      setRetryingAi(false)
       setStatus(null)
     }
   }
@@ -285,7 +344,7 @@ export function MarketConsole() {
               На одном браузере доступно до 5 новых анализов за 24 часа. Повтор одинакового запроса берётся из кэша до 6 часов.
             </p>
           </div>
-          <Button type="submit" size="lg" disabled={Boolean(status)} className="min-w-44">
+          <Button type="submit" size="lg" disabled={Boolean(status) || retryingAi} className="min-w-44">
             {status ? "Выполняется…" : "Найти и разобрать"}
           </Button>
         </div>
@@ -297,7 +356,15 @@ export function MarketConsole() {
       {result?.cached ? <p className="rounded-lg border border-border bg-muted px-4 py-3 text-sm text-muted-foreground">Показан сохранённый результат: он моложе 6 часов.</p> : null}
       {result?.warning ? <p role="status" className="rounded-lg border border-signal/40 bg-signal/10 px-4 py-3 text-sm">{result.warning}</p> : null}
       {result ? <JobBoard jobs={result.jobs} report={result.report} /> : null}
-      {result?.report ? <MarketReport report={result.report} jobCount={result.jobs.length} /> : null}
+      {result?.report ? (
+        <MarketReport
+          report={result.report}
+          jobCount={result.jobs.length}
+          mode={result.mode ?? "fallback"}
+          onRetryAi={result.mode === "fallback" ? handleRetryAi : undefined}
+          retrying={retryingAi}
+        />
+      ) : null}
     </div>
   )
 }

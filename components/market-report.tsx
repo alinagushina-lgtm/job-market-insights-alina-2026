@@ -1,4 +1,6 @@
+import { Button } from "@/components/ui/button"
 import type { MarketReport as MarketReportData } from "@/lib/domain/report"
+import type { AnalysisMode } from "@/lib/domain/stream-event"
 
 function Panel({ label, title, children }: { label: string; title: string; children: React.ReactNode }) {
   return (
@@ -18,15 +20,42 @@ function TextList({ items, empty }: { items: string[]; empty: string }) {
   ) : <p className="text-sm text-muted-foreground">{empty}</p>
 }
 
-export function MarketReport({ report, jobCount }: { report: MarketReportData; jobCount: number }) {
+export function MarketReport({
+  report,
+  jobCount,
+  mode,
+  onRetryAi,
+  retrying = false,
+}: {
+  report: MarketReportData
+  jobCount: number
+  mode: AnalysisMode
+  onRetryAi?: () => void
+  retrying?: boolean
+}) {
   return (
     <section id="report" aria-labelledby="report-title" className="flex flex-col gap-4">
       <div className="animate-fade-rise rounded-xl border border-border bg-foreground p-5 text-background shadow-sm lg:p-7">
-        <p className="font-mono text-[11px] uppercase tracking-[0.18em] opacity-60">вывод по {jobCount} вакансиям</p>
+        <div className="flex flex-wrap items-center gap-2 font-mono text-[11px] uppercase tracking-[0.18em]">
+          <span className="opacity-60">вывод по {jobCount} вакансиям</span>
+          <span className="rounded-full border border-background/25 px-2.5 py-1 tracking-[0.12em]">
+            {mode === "ai" ? "AI-анализ" : "Резервный анализ"}
+          </span>
+        </div>
         <h2 id="report-title" className="mt-3 max-w-4xl text-balance text-xl font-medium leading-snug tracking-tight lg:text-2xl">
           {report.summary}
         </h2>
         <p className="mt-4 max-w-3xl text-sm leading-relaxed opacity-70">{report.sampleNotice}</p>
+        {mode === "fallback" && onRetryAi ? (
+          <div className="mt-5 flex flex-col gap-3 border-t border-background/20 pt-4 sm:flex-row sm:items-center sm:justify-between">
+            <p className="max-w-2xl text-xs leading-relaxed opacity-70">
+              Этот отчёт рассчитан из данных вакансий и остаётся доступным, даже если внешний AI-сервис не отвечает.
+            </p>
+            <Button type="button" variant="secondary" onClick={onRetryAi} disabled={retrying}>
+              {retrying ? "Повторяем AI-анализ…" : "Повторить AI-анализ"}
+            </Button>
+          </div>
+        ) : null}
       </div>
 
       <div className="grid gap-4 lg:grid-cols-2">

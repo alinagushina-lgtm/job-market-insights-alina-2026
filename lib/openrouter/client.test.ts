@@ -65,7 +65,7 @@ describe("analyzeMarket", () => {
     expect(report.matchScores).toHaveLength(1)
     const request = fetcher.mock.calls[0]?.[1]
     expect(request).toBeDefined()
-    expect(JSON.parse(String(request?.body))).toMatchObject({ model: OPENROUTER_MODEL, max_tokens: 4000 })
+    expect(JSON.parse(String(request?.body))).toMatchObject({ model: OPENROUTER_MODEL, max_tokens: 2500 })
   })
 
   it("принимает JSON в markdown-блоке или после короткого вступления", async () => {
@@ -84,6 +84,48 @@ describe("analyzeMarket", () => {
       .mockResolvedValueOnce(responseWith(validReport)) as unknown as typeof fetch
 
     await expect(analyzeMarket(facts, { apiKey: "test", fetcher })).resolves.toBeTruthy()
+    expect(fetcher).toHaveBeenCalledTimes(2)
+  })
+
+  it("повторяет HTTP 429 и сообщает результат каждой попытки", async () => {
+    const attempts: Array<{ attempt: number; outcome: string; diagnostic?: string }> = []
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("", { status: 429 }))
+      .mockResolvedValueOnce(responseWith(validReport)) as unknown as typeof fetch
+
+    await expect(analyzeMarket(facts, {
+      apiKey: "test",
+      fetcher,
+      sleep: async () => undefined,
+      onAttempt: (event) => attempts.push(event),
+    })).resolves.toBeTruthy()
+    expect(fetcher).toHaveBeenCalledTimes(2)
+    expect(attempts).toMatchObject([
+      { attempt: 1, outcome: "retry", diagnostic: "http_429" },
+      { attempt: 2, outcome: "success" },
+    ])
+  })
+
+  it("не повторяет ошибку авторизации", async () => {
+    const fetcher = vi.fn(async () => new Response("", { status: 401 })) as unknown as typeof fetch
+
+    await expect(analyzeMarket(facts, { apiKey: "test", fetcher })).rejects.toMatchObject({ code: "authorization" })
+    expect(fetcher).toHaveBeenCalledTimes(1)
+  })
+
+  it("ограничивает зависшую попытку таймаутом и делает не более двух попыток", async () => {
+    const fetcher = vi.fn(async (_input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new DOMException("Timed out", "TimeoutError")), { once: true })
+      })) as unknown as typeof fetch
+
+    await expect(analyzeMarket(facts, {
+      apiKey: "test",
+      fetcher,
+      timeoutMs: 5,
+      retryDelayMs: 0,
+    })).rejects.toMatchObject({ code: "timeout" })
     expect(fetcher).toHaveBeenCalledTimes(2)
   })
 })

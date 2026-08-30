@@ -6,6 +6,9 @@ import { buildMarketPrompt } from "@/lib/openrouter/prompt"
 
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 export const OPENROUTER_MODEL = "google/gemini-3.7-flash"
+export const OPENROUTER_ATTEMPT_TIMEOUT_MS = 25_000
+const MAX_ATTEMPTS = 2
+const RETRY_DELAY_MS = 500
 
 const completionSchema = z.object({
   choices: z.array(
@@ -20,13 +23,31 @@ export class OpenRouterAnalysisError extends Error {
     message: string,
     readonly code: "configuration" | "authorization" | "timeout" | "invalid_response" | "upstream",
     readonly diagnostic?: string,
+    readonly retriable = false,
   ) {
     super(message)
     this.name = "OpenRouterAnalysisError"
   }
 }
 
+export type OpenRouterAttemptEvent = {
+  attempt: number
+  outcome: "success" | "retry" | "failure"
+  durationMs: number
+  code?: OpenRouterAnalysisError["code"]
+  diagnostic?: string
+}
+
 type Fetcher = typeof fetch
+type AnalyzeMarketOptions = {
+  apiKey?: string
+  fetcher?: Fetcher
+  signal?: AbortSignal
+  timeoutMs?: number
+  retryDelayMs?: number
+  sleep?: (milliseconds: number) => Promise<void>
+  onAttempt?: (event: OpenRouterAttemptEvent) => void
+}
 
 function parseJsonContent(content: string) {
   const trimmed = content.trim()
@@ -45,8 +66,8 @@ function parseJsonContent(content: string) {
   }
 }
 
-function requestSignal(signal?: AbortSignal) {
-  const timeout = AbortSignal.timeout(90_000)
+function requestSignal(signal: AbortSignal | undefined, timeoutMs: number) {
+  const timeout = AbortSignal.timeout(timeoutMs)
   return signal ? AbortSignal.any([signal, timeout]) : timeout
 }
 
@@ -69,7 +90,8 @@ async function requestReport(
   facts: AnalysisFacts,
   apiKey: string,
   fetcher: Fetcher,
-  signal?: AbortSignal,
+  signal: AbortSignal | undefined,
+  timeoutMs: number,
 ): Promise<MarketReport> {
   const response = await fetcher(OPENROUTER_URL, {
     method: "POST",
@@ -83,29 +105,43 @@ async function requestReport(
       model: OPENROUTER_MODEL,
       messages: [{ role: "user", content: buildMarketPrompt(facts) }],
       temperature: 0.2,
-      max_tokens: 4000,
+      max_tokens: 2500,
       provider: { require_parameters: true },
       response_format: {
         type: "json_schema",
         json_schema: { name: "job_market_report", strict: true, schema: MARKET_REPORT_JSON_SCHEMA },
       },
     }),
-    signal: requestSignal(signal),
+    signal: requestSignal(signal, timeoutMs),
   })
 
   if (!response.ok) {
     if (response.status === 401 || response.status === 403) {
-      throw new OpenRouterAnalysisError("Ключ OpenRouter не принят", "authorization")
+      throw new OpenRouterAnalysisError("Ключ OpenRouter не принят", "authorization", `http_${response.status}`)
     }
-    throw new OpenRouterAnalysisError("Сервис анализа временно недоступен", "upstream", `http_${response.status}`)
+    const retriable = response.status === 429 || response.status >= 500
+    throw new OpenRouterAnalysisError(
+      "Сервис анализа временно недоступен",
+      "upstream",
+      `http_${response.status}`,
+      retriable,
+    )
   }
 
-  const completion = completionSchema.safeParse(await response.json())
+  let responseBody: unknown
+  try {
+    responseBody = await response.json()
+  } catch {
+    throw new OpenRouterAnalysisError("Модель вернула ответ неверного формата", "invalid_response", "response_json", true)
+  }
+
+  const completion = completionSchema.safeParse(responseBody)
   if (!completion.success) {
     throw new OpenRouterAnalysisError(
       "Модель вернула неполный ответ",
       "invalid_response",
       completion.error.issues[0]?.path.join(".") || "completion_schema",
+      true,
     )
   }
 
@@ -116,29 +152,47 @@ async function requestReport(
     const diagnostic = error instanceof z.ZodError
       ? `${error.issues[0]?.path.join(".")}:${error.issues[0]?.message}`
       : error instanceof Error ? error.name : "json_parse"
-    throw new OpenRouterAnalysisError("Модель вернула ответ неверного формата", "invalid_response", diagnostic)
+    throw new OpenRouterAnalysisError("Модель вернула ответ неверного формата", "invalid_response", diagnostic, true)
   }
 }
 
-export async function analyzeMarket(
-  facts: AnalysisFacts,
-  options: { apiKey?: string; fetcher?: Fetcher; signal?: AbortSignal } = {},
-) {
+function normalizeAttemptError(error: unknown) {
+  if (error instanceof OpenRouterAnalysisError) return error
+  if (error instanceof DOMException && (error.name === "AbortError" || error.name === "TimeoutError")) {
+    return new OpenRouterAnalysisError("Анализ занял слишком много времени", "timeout", error.name, true)
+  }
+  const diagnostic = error instanceof Error ? `${error.name}:${error.message}`.slice(0, 240) : "unknown"
+  return new OpenRouterAnalysisError("Сервис анализа временно недоступен", "upstream", diagnostic, true)
+}
+
+export async function analyzeMarket(facts: AnalysisFacts, options: AnalyzeMarketOptions = {}) {
   const apiKey = options.apiKey ?? process.env.OPENROUTER_API_KEY
   if (!apiKey) throw new OpenRouterAnalysisError("OpenRouter не настроен", "configuration")
   const fetcher = options.fetcher ?? fetch
+  const sleep = options.sleep ?? ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)))
+  const timeoutMs = options.timeoutMs ?? OPENROUTER_ATTEMPT_TIMEOUT_MS
+  const retryDelayMs = options.retryDelayMs ?? RETRY_DELAY_MS
 
-  try {
-    return await requestReport(facts, apiKey, fetcher, options.signal)
-  } catch (error) {
-    if (error instanceof OpenRouterAnalysisError && error.code === "invalid_response") {
-      return requestReport(facts, apiKey, fetcher, options.signal)
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    const startedAt = Date.now()
+    try {
+      const report = await requestReport(facts, apiKey, fetcher, options.signal, timeoutMs)
+      options.onAttempt?.({ attempt, outcome: "success", durationMs: Date.now() - startedAt })
+      return report
+    } catch (rawError) {
+      const error = normalizeAttemptError(rawError)
+      const willRetry = attempt < MAX_ATTEMPTS && error.retriable && !options.signal?.aborted
+      options.onAttempt?.({
+        attempt,
+        outcome: willRetry ? "retry" : "failure",
+        durationMs: Date.now() - startedAt,
+        code: error.code,
+        diagnostic: error.diagnostic,
+      })
+      if (!willRetry) throw error
+      await sleep(retryDelayMs)
     }
-    if (error instanceof OpenRouterAnalysisError) throw error
-    if (error instanceof DOMException && (error.name === "AbortError" || error.name === "TimeoutError")) {
-      throw new OpenRouterAnalysisError("Анализ занял слишком много времени", "timeout")
-    }
-    const diagnostic = error instanceof Error ? `${error.name}:${error.message}`.slice(0, 240) : "unknown"
-    throw new OpenRouterAnalysisError("Сервис анализа временно недоступен", "upstream", diagnostic)
   }
+
+  throw new OpenRouterAnalysisError("Сервис анализа временно недоступен", "upstream")
 }

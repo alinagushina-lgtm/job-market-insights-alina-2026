@@ -1,11 +1,15 @@
 import { buildAnalysisFacts } from "@/lib/analysis/build-facts"
+import { buildAiFacts, buildFallbackReport } from "@/lib/analysis/reliable-report"
 import { groupJobsBySalary } from "@/lib/analysis/classify-salary"
 import { searchRequestSchema } from "@/lib/domain/search-schema"
 import type { StreamEvent } from "@/lib/domain/stream-event"
 import { JobSearchError, searchJobs } from "@/lib/jobs/search"
+import { logServerEvent, requestId as createRequestId } from "@/lib/observability/server-log"
 import { analyzeMarket, OpenRouterAnalysisError } from "@/lib/openrouter/client"
 import { encodeStreamEvent } from "@/lib/stream/ndjson"
 import { verifyTurnstile } from "@/lib/turnstile/verify"
+
+export const maxDuration = 180
 
 const MAX_BODY_BYTES = 32_000
 
@@ -18,6 +22,8 @@ function clientIp(request: Request) {
 }
 
 export async function POST(request: Request) {
+  const requestId = createRequestId(request)
+  const requestStartedAt = Date.now()
   const contentLength = Number(request.headers.get("content-length") ?? 0)
   if (contentLength > MAX_BODY_BYTES) return jsonError("Слишком большой запрос", 413)
 
@@ -39,9 +45,16 @@ export async function POST(request: Request) {
     )
   }
 
+  const turnstileStartedAt = Date.now()
   const turnstile = await verifyTurnstile(parsed.data.turnstileToken, undefined, clientIp(request))
   if (!turnstile.success) {
     const status = turnstile.code === "configuration" ? 503 : 403
+    logServerEvent("warn", "analysis.turnstile_failed", {
+      requestId,
+      durationMs: Date.now() - turnstileStartedAt,
+      code: turnstile.code,
+      status,
+    })
     const message = status === 503 ? "Защита формы пока не настроена" : "Подтвердите, что вы не робот"
     return jsonError(message, status)
   }
@@ -70,8 +83,14 @@ export async function POST(request: Request) {
 
       try {
         send({ type: "status", status: "searching", message: "Ищем свежие вакансии за последние 7 дней" })
+        const searchStartedAt = Date.now()
         const rawJobs = await searchJobs(parsed.data.search)
         const jobs = groupJobsBySalary(rawJobs, parsed.data.search)
+        logServerEvent("info", "analysis.jobs_ready", {
+          requestId,
+          durationMs: Date.now() - searchStartedAt,
+          jobCount: jobs.length,
+        })
         send({ type: "jobs", jobs, searchedAt: new Date().toISOString() })
 
         if (jobs.length === 0) {
@@ -81,31 +100,60 @@ export async function POST(request: Request) {
             message: "Английских вакансий по этому сочетанию профессии и места не найдено. Попробуйте английское название, другую страну или поиск по всему миру.",
           })
           send({ type: "complete" })
+          logServerEvent("info", "analysis.complete", {
+            requestId,
+            durationMs: Date.now() - requestStartedAt,
+            jobCount: 0,
+            mode: "empty",
+          })
           close()
           return
         }
 
-        send({ type: "status", status: "analyzing", message: `Анализируем требования в ${jobs.length} вакансиях` })
+        const fullFacts = buildAnalysisFacts(jobs, parsed.data.search, parsed.data.profile)
+        const fallbackReport = buildFallbackReport(fullFacts)
+        send({ type: "analysis", report: fallbackReport, mode: "fallback" })
+        logServerEvent("info", "analysis.fallback_ready", { requestId, jobCount: jobs.length })
+
+        send({ type: "status", status: "analyzing", message: "Уточняем резервный отчёт с помощью AI" })
+        const aiFacts = buildAiFacts(jobs, parsed.data.search, parsed.data.profile)
         try {
-          const facts = buildAnalysisFacts(jobs, parsed.data.search, parsed.data.profile)
-          const report = await analyzeMarket(facts, { signal: request.signal })
-          send({ type: "analysis", report })
+          const report = await analyzeMarket(aiFacts, {
+            signal: request.signal,
+            onAttempt: (attempt) => logServerEvent(
+              attempt.outcome === "failure" ? "warn" : "info",
+              "analysis.openrouter_attempt",
+              { requestId, selectedJobCount: aiFacts.jobs.length, ...attempt },
+            ),
+          })
+          send({ type: "analysis", report, mode: "ai" })
+          logServerEvent("info", "analysis.ai_ready", { requestId, selectedJobCount: aiFacts.jobs.length })
         } catch (error) {
-          if (error instanceof OpenRouterAnalysisError) {
-            console.warn("OpenRouter analysis failed", { code: error.code, diagnostic: error.diagnostic })
-          }
-          const message =
-            error instanceof OpenRouterAnalysisError
-              ? `${error.message}. Вакансии уже доступны ниже.`
-              : "Не удалось завершить анализ. Вакансии уже доступны ниже."
-          send({ type: "warning", code: "analysis_unavailable", message })
+          const code = error instanceof OpenRouterAnalysisError ? error.code : "unknown"
+          const diagnostic = error instanceof OpenRouterAnalysisError ? error.diagnostic : undefined
+          logServerEvent("warn", "analysis.ai_fallback", { requestId, code, diagnostic })
+          send({
+            type: "warning",
+            code: "ai_fallback",
+            message: "AI-анализ сейчас недоступен. Показан полноценный резервный отчёт по найденным вакансиям — AI можно повторить отдельно.",
+          })
         }
 
         send({ type: "complete" })
+        logServerEvent("info", "analysis.complete", {
+          requestId,
+          durationMs: Date.now() - requestStartedAt,
+          jobCount: jobs.length,
+        })
         close()
       } catch (error) {
         const message =
           error instanceof JobSearchError ? error.message : "Не удалось получить вакансии. Попробуйте ещё раз позже."
+        logServerEvent("error", "analysis.job_search_failed", {
+          requestId,
+          durationMs: Date.now() - requestStartedAt,
+          code: error instanceof JobSearchError ? error.code : "unknown",
+        })
         send({ type: "error", code: "job_search_failed", message })
         send({ type: "complete" })
         close()
@@ -118,6 +166,7 @@ export async function POST(request: Request) {
       "Content-Type": "application/x-ndjson; charset=utf-8",
       "Cache-Control": "no-store",
       "X-Content-Type-Options": "nosniff",
+      "X-Request-Id": requestId,
     },
   })
 }

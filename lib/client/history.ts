@@ -1,8 +1,9 @@
 import type { JobWithSalaryGroup } from "@/lib/domain/job"
 import type { MarketReport } from "@/lib/domain/report"
 import type { SearchRequest } from "@/lib/domain/search-schema"
+import type { AnalysisMode } from "@/lib/domain/stream-event"
 
-const STORAGE_KEY = "job-market-insights:v3"
+const STORAGE_KEY = "job-market-insights:v4"
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000
 const RATE_WINDOW_MS = 24 * 60 * 60 * 1000
 const RATE_LIMIT = 5
@@ -12,25 +13,26 @@ export type StoredResult = {
   createdAt: number
   jobs: JobWithSalaryGroup[]
   report?: MarketReport
+  mode?: AnalysisMode
   warning?: string
 }
 
 type StoredState = {
-  version: 3
+  version: 4
   attempts: number[]
   results: StoredResult[]
 }
 
 function emptyState(): StoredState {
-  return { version: 3, attempts: [], results: [] }
+  return { version: 4, attempts: [], results: [] }
 }
 
 function readState(storage: Storage, now = Date.now()): StoredState {
   try {
     const raw = JSON.parse(storage.getItem(STORAGE_KEY) ?? "null") as Partial<StoredState> | null
-    if (!raw || raw.version !== 3 || !Array.isArray(raw.attempts) || !Array.isArray(raw.results)) return emptyState()
+    if (!raw || raw.version !== 4 || !Array.isArray(raw.attempts) || !Array.isArray(raw.results)) return emptyState()
     return {
-      version: 3,
+      version: 4,
       attempts: raw.attempts.filter((time): time is number => typeof time === "number" && now - time < RATE_WINDOW_MS),
       results: raw.results.filter(
         (result): result is StoredResult =>

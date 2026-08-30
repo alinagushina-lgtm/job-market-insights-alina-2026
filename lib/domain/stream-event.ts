@@ -2,11 +2,12 @@ import type { JobWithSalaryGroup } from "@/lib/domain/job"
 import type { MarketReport } from "@/lib/domain/report"
 
 export type AnalysisStatus = "verifying" | "searching" | "analyzing"
+export type AnalysisMode = "fallback" | "ai"
 
 export type StreamEvent =
   | { type: "status"; status: AnalysisStatus; message: string }
   | { type: "jobs"; jobs: JobWithSalaryGroup[]; searchedAt: string }
-  | { type: "analysis"; report: MarketReport }
+  | { type: "analysis"; report: MarketReport; mode: AnalysisMode }
   | { type: "warning"; code: string; message: string }
   | { type: "error"; code: string; message: string }
   | { type: "complete" }
