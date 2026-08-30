@@ -1,4 +1,6 @@
 import type { AnalysisFacts } from "@/lib/analysis/build-facts"
+import { getAuthenticatedContext } from "@/lib/auth/session"
+import { claimAiRetry } from "@/lib/credits/service"
 import { retryAnalysisRequestSchema } from "@/lib/domain/retry-analysis-schema"
 import { logServerEvent, requestId as createRequestId } from "@/lib/observability/server-log"
 import { analyzeMarket, OpenRouterAnalysisError } from "@/lib/openrouter/client"
@@ -15,6 +17,15 @@ function clientIp(request: Request) {
 export async function POST(request: Request) {
   const requestId = createRequestId(request)
   const startedAt = Date.now()
+
+  let authContext: Awaited<ReturnType<typeof getAuthenticatedContext>>
+  try {
+    authContext = await getAuthenticatedContext()
+  } catch {
+    return Response.json({ error: "Сервис аккаунтов временно недоступен" }, { status: 503 })
+  }
+  if (!authContext) return Response.json({ error: "Войдите в аккаунт" }, { status: 401 })
+
   const contentLength = Number(request.headers.get("content-length") ?? 0)
   if (contentLength > MAX_BODY_BYTES) return Response.json({ error: "Слишком большой запрос" }, { status: 413 })
 
@@ -40,6 +51,14 @@ export async function POST(request: Request) {
     )
   }
 
+  const retryPermission = await claimAiRetry(authContext.supabase, parsed.data.analysisRunId)
+  if (retryPermission === "unavailable") {
+    return Response.json({ error: "Не удалось проверить право на повтор. Попробуйте позже." }, { status: 503 })
+  }
+  if (retryPermission === "used_or_foreign") {
+    return Response.json({ error: "Бесплатный повтор уже использован или результат вам не принадлежит." }, { status: 409 })
+  }
+
   const facts = parsed.data.facts as AnalysisFacts
   try {
     const report = await analyzeMarket(facts, {
@@ -52,6 +71,7 @@ export async function POST(request: Request) {
     })
     logServerEvent("info", "analysis.retry_complete", {
       requestId,
+      analysisRunId: parsed.data.analysisRunId,
       durationMs: Date.now() - startedAt,
       selectedJobCount: facts.jobs.length,
     })
@@ -62,6 +82,7 @@ export async function POST(request: Request) {
     const analysisError = error instanceof OpenRouterAnalysisError ? error : null
     logServerEvent("warn", "analysis.retry_failed", {
       requestId,
+      analysisRunId: parsed.data.analysisRunId,
       durationMs: Date.now() - startedAt,
       code: analysisError?.code ?? "unknown",
       diagnostic: analysisError?.diagnostic,

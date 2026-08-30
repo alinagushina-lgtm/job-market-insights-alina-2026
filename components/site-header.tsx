@@ -1,4 +1,11 @@
+"use client"
+
+import { signOutAction } from "@/app/login/actions"
+import { useAccount } from "@/components/account-provider"
+
 export function SiteHeader() {
+  const { email, credits } = useAccount()
+
   return (
     <header className="sticky top-0 z-20 border-b border-border bg-background/85 backdrop-blur-md">
       <div className="mx-auto flex max-w-6xl items-center justify-between gap-6 px-5 py-3.5 lg:px-8">
@@ -21,7 +28,17 @@ export function SiteHeader() {
           </a>
         </nav>
 
-        <p className="font-mono text-[11px] text-muted-foreground">вакансии за 7 дней</p>
+        <div className="flex items-center gap-3">
+          <div className="hidden text-right sm:block">
+            <p className="max-w-48 truncate text-xs text-muted-foreground" title={email}>{email}</p>
+            <p className="font-mono text-[11px] text-foreground">кредитов: {credits}</p>
+          </div>
+          <form action={signOutAction}>
+            <button type="submit" className="rounded-md border border-border px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground">
+              Выйти
+            </button>
+          </form>
+        </div>
       </div>
     </header>
   )

@@ -1,6 +1,8 @@
 import { buildAnalysisFacts } from "@/lib/analysis/build-facts"
 import { buildAiFacts, buildFallbackReport } from "@/lib/analysis/reliable-report"
 import { groupJobsBySalary } from "@/lib/analysis/classify-salary"
+import { getAuthenticatedContext } from "@/lib/auth/session"
+import { consumeAnalysisCredit, getCreditBalance } from "@/lib/credits/service"
 import { searchRequestSchema } from "@/lib/domain/search-schema"
 import type { StreamEvent } from "@/lib/domain/stream-event"
 import { JobSearchError, searchJobs } from "@/lib/jobs/search"
@@ -24,6 +26,19 @@ function clientIp(request: Request) {
 export async function POST(request: Request) {
   const requestId = createRequestId(request)
   const requestStartedAt = Date.now()
+
+  let authContext: Awaited<ReturnType<typeof getAuthenticatedContext>>
+  try {
+    authContext = await getAuthenticatedContext()
+  } catch {
+    return jsonError("Сервис аккаунтов временно недоступен", 503)
+  }
+  if (!authContext) return jsonError("Войдите в аккаунт", 401)
+
+  const currentCredits = await getCreditBalance(authContext.supabase, authContext.userId)
+  if (currentCredits === null) return jsonError("Не удалось проверить баланс кредитов", 503)
+  if (currentCredits <= 0) return jsonError("Кредиты закончились", 402)
+
   const contentLength = Number(request.headers.get("content-length") ?? 0)
   if (contentLength > MAX_BODY_BYTES) return jsonError("Слишком большой запрос", 413)
 
@@ -91,9 +106,8 @@ export async function POST(request: Request) {
           durationMs: Date.now() - searchStartedAt,
           jobCount: jobs.length,
         })
-        send({ type: "jobs", jobs, searchedAt: new Date().toISOString() })
-
         if (jobs.length === 0) {
+          send({ type: "jobs", jobs, searchedAt: new Date().toISOString() })
           send({
             type: "warning",
             code: "empty_sample",
@@ -109,6 +123,37 @@ export async function POST(request: Request) {
           close()
           return
         }
+
+        const location = [parsed.data.search.country, parsed.data.search.city].filter(Boolean).join(":")
+        const credit = await consumeAnalysisCredit(
+          authContext.supabase,
+          parsed.data.search.title,
+          location,
+        )
+        if (credit.status === "unavailable") {
+          send({ type: "error", code: "credits_unavailable", message: "Не удалось списать кредит. Попробуйте ещё раз позже." })
+          send({ type: "complete" })
+          close()
+          return
+        }
+        if (credit.status === "exhausted") {
+          send({ type: "error", code: "credits_exhausted", message: "Кредиты закончились" })
+          send({ type: "complete" })
+          close()
+          return
+        }
+
+        send({
+          type: "credits",
+          analysisRunId: credit.analysisRunId,
+          remainingCredits: credit.remainingCredits,
+        })
+        send({ type: "jobs", jobs, searchedAt: new Date().toISOString() })
+        logServerEvent("info", "analysis.credit_consumed", {
+          requestId,
+          analysisRunId: credit.analysisRunId,
+          remainingCredits: credit.remainingCredits,
+        })
 
         const fullFacts = buildAnalysisFacts(jobs, parsed.data.search, parsed.data.profile)
         const fallbackReport = buildFallbackReport(fullFacts)

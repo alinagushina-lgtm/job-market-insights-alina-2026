@@ -3,10 +3,9 @@ import type { MarketReport } from "@/lib/domain/report"
 import type { SearchRequest } from "@/lib/domain/search-schema"
 import type { AnalysisMode } from "@/lib/domain/stream-event"
 
-const STORAGE_KEY = "job-market-insights:v4"
+const STORAGE_KEY = "job-market-insights:v5"
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000
-const RATE_WINDOW_MS = 24 * 60 * 60 * 1000
-const RATE_LIMIT = 5
+const MAX_RESULTS = 5
 
 export type StoredResult = {
   key: string
@@ -15,25 +14,24 @@ export type StoredResult = {
   report?: MarketReport
   mode?: AnalysisMode
   warning?: string
+  analysisRunId?: string
 }
 
 type StoredState = {
-  version: 4
-  attempts: number[]
+  version: 5
   results: StoredResult[]
 }
 
 function emptyState(): StoredState {
-  return { version: 4, attempts: [], results: [] }
+  return { version: 5, results: [] }
 }
 
 function readState(storage: Storage, now = Date.now()): StoredState {
   try {
     const raw = JSON.parse(storage.getItem(STORAGE_KEY) ?? "null") as Partial<StoredState> | null
-    if (!raw || raw.version !== 4 || !Array.isArray(raw.attempts) || !Array.isArray(raw.results)) return emptyState()
+    if (!raw || raw.version !== 5 || !Array.isArray(raw.results)) return emptyState()
     return {
-      version: 4,
-      attempts: raw.attempts.filter((time): time is number => typeof time === "number" && now - time < RATE_WINDOW_MS),
+      version: 5,
       results: raw.results.filter(
         (result): result is StoredResult =>
           Boolean(result) && typeof result.key === "string" && typeof result.createdAt === "number" && now - result.createdAt < CACHE_TTL_MS,
@@ -62,20 +60,8 @@ export function findCachedResult(storage: Storage, key: string, now = Date.now()
   return state.results.find((result) => result.key === key)
 }
 
-export function registerAnalysisAttempt(storage: Storage, now = Date.now()) {
-  const state = readState(storage, now)
-  if (state.attempts.length >= RATE_LIMIT) return false
-  state.attempts.push(now)
-  writeState(storage, state)
-  return true
-}
-
-export function canStartAnalysis(storage: Storage, now = Date.now()) {
-  return readState(storage, now).attempts.length < RATE_LIMIT
-}
-
 export function saveResult(storage: Storage, result: StoredResult, now = Date.now()) {
   const state = readState(storage, now)
-  state.results = [result, ...state.results.filter((item) => item.key !== result.key)].slice(0, RATE_LIMIT)
+  state.results = [result, ...state.results.filter((item) => item.key !== result.key)].slice(0, MAX_RESULTS)
   writeState(storage, state)
 }

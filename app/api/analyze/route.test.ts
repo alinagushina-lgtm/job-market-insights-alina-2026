@@ -4,6 +4,9 @@ const mocks = vi.hoisted(() => ({
   searchJobs: vi.fn(),
   analyzeMarket: vi.fn(),
   verifyTurnstile: vi.fn(),
+  getAuthenticatedContext: vi.fn(),
+  getCreditBalance: vi.fn(),
+  consumeAnalysisCredit: vi.fn(),
 }))
 
 vi.mock("@/lib/jobs/search", async (importOriginal) => ({
@@ -15,6 +18,11 @@ vi.mock("@/lib/openrouter/client", async (importOriginal) => ({
   analyzeMarket: mocks.analyzeMarket,
 }))
 vi.mock("@/lib/turnstile/verify", () => ({ verifyTurnstile: mocks.verifyTurnstile }))
+vi.mock("@/lib/auth/session", () => ({ getAuthenticatedContext: mocks.getAuthenticatedContext }))
+vi.mock("@/lib/credits/service", () => ({
+  getCreditBalance: mocks.getCreditBalance,
+  consumeAnalysisCredit: mocks.consumeAnalysisCredit,
+}))
 
 import { POST } from "@/app/api/analyze/route"
 import { buildAnalysisFacts } from "@/lib/analysis/build-facts"
@@ -66,6 +74,29 @@ describe("POST /api/analyze", () => {
     vi.spyOn(console, "error").mockImplementation(() => undefined)
     mocks.verifyTurnstile.mockResolvedValue({ success: true })
     mocks.searchJobs.mockResolvedValue([job])
+    mocks.getAuthenticatedContext.mockResolvedValue({ userId: "user-1", email: "student@example.com", supabase: {} })
+    mocks.getCreditBalance.mockResolvedValue(5)
+    mocks.consumeAnalysisCredit.mockResolvedValue({ status: "success", analysisRunId: "run-1", remainingCredits: 4 })
+  })
+
+  it("отклоняет запрос без сессии до внешних сервисов", async () => {
+    mocks.getAuthenticatedContext.mockResolvedValue(null)
+
+    const response = await POST(request())
+
+    expect(response.status).toBe(401)
+    expect(mocks.verifyTurnstile).not.toHaveBeenCalled()
+    expect(mocks.searchJobs).not.toHaveBeenCalled()
+  })
+
+  it("не запускает поиск при нулевом балансе", async () => {
+    mocks.getCreditBalance.mockResolvedValue(0)
+
+    const response = await POST(request())
+
+    expect(response.status).toBe(402)
+    expect(mocks.searchJobs).not.toHaveBeenCalled()
+    expect(mocks.consumeAnalysisCredit).not.toHaveBeenCalled()
   })
 
   it("отдает резервный отчет до успешного AI-отчета", async () => {
@@ -76,6 +107,9 @@ describe("POST /api/analyze", () => {
     const reports = result.filter((event) => event.type === "analysis")
 
     expect(reports.map((event) => event.mode)).toEqual(["fallback", "ai"])
+    expect(result.findIndex((event) => event.type === "credits")).toBeLessThan(result.findIndex((event) => event.type === "jobs"))
+    expect(result).toContainEqual({ type: "credits", analysisRunId: "run-1", remainingCredits: 4 })
+    expect(mocks.consumeAnalysisCredit).toHaveBeenCalledTimes(1)
     expect(reports[0]).toMatchObject({ report: { summary: expect.stringContaining("В выборке 1") } })
     expect(reports[1]).toMatchObject({ report: { summary: "AI-отчет готов" } })
     expect(result.at(-1)).toEqual({ type: "complete" })
@@ -93,5 +127,14 @@ describe("POST /api/analyze", () => {
     expect(reports[0]).toMatchObject({ mode: "fallback" })
     expect(result).toContainEqual(expect.objectContaining({ type: "warning", code: "ai_fallback" }))
     expect(result.at(-1)).toEqual({ type: "complete" })
+  })
+
+  it("не списывает кредит для пустой выборки", async () => {
+    mocks.searchJobs.mockResolvedValue([])
+
+    const result = await events(await POST(request()))
+
+    expect(mocks.consumeAnalysisCredit).not.toHaveBeenCalled()
+    expect(result).toContainEqual(expect.objectContaining({ type: "warning", code: "empty_sample" }))
   })
 })

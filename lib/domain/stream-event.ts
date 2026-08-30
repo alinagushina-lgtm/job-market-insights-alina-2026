@@ -6,6 +6,7 @@ export type AnalysisMode = "fallback" | "ai"
 
 export type StreamEvent =
   | { type: "status"; status: AnalysisStatus; message: string }
+  | { type: "credits"; analysisRunId: string; remainingCredits: number }
   | { type: "jobs"; jobs: JobWithSalaryGroup[]; searchedAt: string }
   | { type: "analysis"; report: MarketReport; mode: AnalysisMode }
   | { type: "warning"; code: string; message: string }

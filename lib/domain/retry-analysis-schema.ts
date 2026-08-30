@@ -40,6 +40,7 @@ export const analysisFactsSchema = z.object({
 })
 
 export const retryAnalysisRequestSchema = z.object({
+  analysisRunId: z.string().uuid(),
   facts: analysisFactsSchema,
   turnstileToken: z.string().trim().min(1).max(2048),
 })

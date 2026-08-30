@@ -7,8 +7,9 @@ import { MarketReport } from "@/components/market-report"
 import { ThinkingStage } from "@/components/thinking-stage"
 import { TurnstileWidget } from "@/components/turnstile-widget"
 import { Button } from "@/components/ui/button"
+import { useAccount } from "@/components/account-provider"
 import { buildAiFacts } from "@/lib/analysis/reliable-report"
-import { canStartAnalysis, findCachedResult, registerAnalysisAttempt, requestCacheKey, saveResult } from "@/lib/client/history"
+import { findCachedResult, requestCacheKey, saveResult } from "@/lib/client/history"
 import { readNdjson } from "@/lib/client/stream"
 import { COUNTRIES, SALARY_CURRENCIES, countryByCode, countryByInput } from "@/lib/domain/countries"
 import type { JobWithSalaryGroup } from "@/lib/domain/job"
@@ -35,6 +36,8 @@ type ResultState = {
   mode?: AnalysisMode
   warning?: string
   cached?: boolean
+  analysisRunId?: string
+  retryUsed?: boolean
 }
 
 function splitSkills(value: string) {
@@ -42,6 +45,7 @@ function splitSkills(value: string) {
 }
 
 export function MarketConsole() {
+  const { credits, setCredits } = useAccount()
   const [title, setTitle] = useState("")
   const [alternateTitle, setAlternateTitle] = useState("")
   const [country, setCountry] = useState<JobSearch["country"] | null>("WORLD")
@@ -107,7 +111,14 @@ export function MarketConsole() {
     const cacheKey = requestCacheKey(requestWithoutToken)
     const cached = findCachedResult(localStorage, cacheKey)
     if (cached) {
-      setResult({ jobs: cached.jobs, report: cached.report, mode: cached.mode, warning: cached.warning, cached: true })
+      setResult({
+        jobs: cached.jobs,
+        report: cached.report,
+        mode: cached.mode,
+        warning: cached.warning,
+        cached: true,
+        analysisRunId: cached.analysisRunId,
+      })
       return
     }
 
@@ -115,8 +126,8 @@ export function MarketConsole() {
       setError("Завершите проверку безопасности перед поиском.")
       return
     }
-    if (!canStartAnalysis(localStorage)) {
-      setError("На этом устройстве уже выполнено 5 новых анализов за 24 часа. Сохранённые результаты доступны 6 часов.")
+    if (credits <= 0) {
+      setError("Кредиты закончились. Сохранённые результаты по-прежнему доступны 6 часов.")
       return
     }
 
@@ -130,6 +141,7 @@ export function MarketConsole() {
     let streamedReport: MarketReportData | undefined
     let streamedMode: AnalysisMode | undefined
     let streamedWarning: string | undefined
+    let streamedAnalysisRunId: string | undefined
 
     try {
       const response = await fetch("/api/analyze", {
@@ -139,26 +151,34 @@ export function MarketConsole() {
       })
       if (!response.ok) {
         const body = await response.json().catch(() => null) as { error?: string } | null
+        if (response.status === 402) setCredits(0)
         throw new Error(body?.error ?? "Сервер не принял запрос")
       }
-      registerAnalysisAttempt(localStorage)
 
       await readNdjson(response, (streamEvent: StreamEvent) => {
         if (streamEvent.type === "status") {
           setStatus(streamEvent.status)
           setStatusMessage(streamEvent.message)
+        } else if (streamEvent.type === "credits") {
+          streamedAnalysisRunId = streamEvent.analysisRunId
+          setCredits(streamEvent.remainingCredits)
+          setResult((current) => ({
+            ...(current ?? { jobs: streamedJobs }),
+            analysisRunId: streamedAnalysisRunId,
+          }))
         } else if (streamEvent.type === "jobs") {
           streamedJobs = streamEvent.jobs
-          setResult({ jobs: streamedJobs })
+          setResult({ jobs: streamedJobs, analysisRunId: streamedAnalysisRunId })
         } else if (streamEvent.type === "analysis") {
           streamedReport = streamEvent.report
           streamedMode = streamEvent.mode
           if (streamedMode === "ai") streamedWarning = undefined
-          setResult({ jobs: streamedJobs, report: streamedReport, mode: streamedMode, warning: streamedWarning })
+          setResult({ jobs: streamedJobs, report: streamedReport, mode: streamedMode, warning: streamedWarning, analysisRunId: streamedAnalysisRunId })
         } else if (streamEvent.type === "warning") {
           streamedWarning = streamEvent.message
-          setResult({ jobs: streamedJobs, report: streamedReport, mode: streamedMode, warning: streamedWarning })
+          setResult({ jobs: streamedJobs, report: streamedReport, mode: streamedMode, warning: streamedWarning, analysisRunId: streamedAnalysisRunId })
         } else if (streamEvent.type === "error") {
+          if (streamEvent.code === "credits_exhausted") setCredits(0)
           setError(streamEvent.message)
         }
       })
@@ -171,6 +191,7 @@ export function MarketConsole() {
           report: streamedReport,
           mode: streamedMode,
           warning: streamedWarning,
+          analysisRunId: streamedAnalysisRunId,
         })
       }
     } catch (requestError) {
@@ -181,7 +202,7 @@ export function MarketConsole() {
   }
 
   async function handleRetryAi() {
-    if (!result?.report || result.mode !== "fallback" || !lastRequest || retryingAi) return
+    if (!result?.report || result.mode !== "fallback" || !result.analysisRunId || result.retryUsed || !lastRequest || retryingAi) return
     setError("")
     if (!turnstileToken) {
       setError("Завершите проверку безопасности, затем повторите AI-анализ.")
@@ -201,12 +222,12 @@ export function MarketConsole() {
       const response = await fetch("/api/analyze/retry", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ facts, turnstileToken: token }),
+        body: JSON.stringify({ analysisRunId: result.analysisRunId, facts, turnstileToken: token }),
       })
       const body = await response.json().catch(() => null) as { error?: string; report?: MarketReportData } | null
       if (!response.ok || !body?.report) throw new Error(body?.error ?? "Не удалось повторить AI-анализ")
 
-      const nextResult: ResultState = { ...result, report: body.report, mode: "ai", warning: undefined, cached: false }
+      const nextResult: ResultState = { ...result, report: body.report, mode: "ai", warning: undefined, cached: false, retryUsed: true }
       setResult(nextResult)
       saveResult(localStorage, {
         key: cacheKey,
@@ -214,10 +235,11 @@ export function MarketConsole() {
         jobs: nextResult.jobs,
         report: nextResult.report,
         mode: nextResult.mode,
+        analysisRunId: nextResult.analysisRunId,
       })
     } catch (requestError) {
       const message = requestError instanceof Error ? requestError.message : "Не удалось повторить AI-анализ"
-      setResult((current) => current ? { ...current, warning: message } : current)
+      setResult((current) => current ? { ...current, warning: message, retryUsed: true } : current)
     } finally {
       setRetryingAi(false)
       setStatus(null)
@@ -341,10 +363,10 @@ export function MarketConsole() {
           <div>
             <TurnstileWidget key={turnstileVersion} onToken={handleTurnstileToken} />
             <p className="mt-2 max-w-md text-xs leading-relaxed text-muted-foreground">
-              На одном браузере доступно до 5 новых анализов за 24 часа. Повтор одинакового запроса берётся из кэша до 6 часов.
+              Новый анализ расходует 1 кредит. Повтор одинакового запроса берётся из кэша бесплатно до 6 часов.
             </p>
           </div>
-          <Button type="submit" size="lg" disabled={Boolean(status) || retryingAi} className="min-w-44">
+          <Button type="submit" size="lg" disabled={Boolean(status) || retryingAi || credits <= 0} className="min-w-44">
             {status ? "Выполняется…" : "Найти и разобрать"}
           </Button>
         </div>
@@ -361,7 +383,7 @@ export function MarketConsole() {
           report={result.report}
           jobCount={result.jobs.length}
           mode={result.mode ?? "fallback"}
-          onRetryAi={result.mode === "fallback" ? handleRetryAi : undefined}
+          onRetryAi={result.mode === "fallback" && result.analysisRunId && !result.retryUsed ? handleRetryAi : undefined}
           retrying={retryingAi}
         />
       ) : null}

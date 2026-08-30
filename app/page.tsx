@@ -1,12 +1,17 @@
 import { MarketConsole } from "@/components/market-console"
+import { AccountProvider } from "@/components/account-provider"
 import { SiteHeader } from "@/components/site-header"
+import { requirePageAccount } from "@/lib/auth/session"
 
-export default function Page() {
+export default async function Page() {
+  const account = await requirePageAccount()
+
   return (
-    <div className="min-h-screen font-sans">
-      <SiteHeader />
+    <AccountProvider email={account.email} initialCredits={account.credits}>
+      <div className="min-h-screen font-sans">
+        <SiteHeader />
 
-      <main>
+        <main>
         {/* hero */}
         <section className="grid-paper border-b border-border">
           <div className="mx-auto max-w-6xl px-5 py-16 lg:px-8 lg:py-24">
@@ -49,14 +54,15 @@ export default function Page() {
           </div>
         </section>
 
-      </main>
+        </main>
 
-      <footer className="border-t border-border">
-        <div className="mx-auto flex max-w-6xl flex-col gap-2 px-5 py-8 lg:flex-row lg:items-center lg:justify-between lg:px-8">
-          <p className="font-mono text-xs text-muted-foreground">Рынок — разбор вакансий вместо бесконечной прокрутки</p>
-          <p className="font-mono text-xs text-muted-foreground">Выводы относятся только к найденной выборке, а не ко всему рынку</p>
-        </div>
-      </footer>
-    </div>
+        <footer className="border-t border-border">
+          <div className="mx-auto flex max-w-6xl flex-col gap-2 px-5 py-8 lg:flex-row lg:items-center lg:justify-between lg:px-8">
+            <p className="font-mono text-xs text-muted-foreground">Рынок — разбор вакансий вместо бесконечной прокрутки</p>
+            <p className="font-mono text-xs text-muted-foreground">Выводы относятся только к найденной выборке, а не ко всему рынку</p>
+          </div>
+        </footer>
+      </div>
+    </AccountProvider>
   )
 }
