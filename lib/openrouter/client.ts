@@ -5,7 +5,7 @@ import { MARKET_REPORT_JSON_SCHEMA, marketReportSchema, type MarketReport } from
 import { buildMarketPrompt } from "@/lib/openrouter/prompt"
 
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-export const OPENROUTER_MODEL = "google/gemini-3.7-flash"
+export const OPENROUTER_MODEL = "openrouter/free"
 export const OPENROUTER_ATTEMPT_TIMEOUT_MS = 25_000
 const MAX_ATTEMPTS = 2
 const RETRY_DELAY_MS = 500

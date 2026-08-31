@@ -56,6 +56,10 @@ function responseWithText(content: string) {
 }
 
 describe("analyzeMarket", () => {
+  it("uses the zero-cost OpenRouter model router", () => {
+    expect(OPENROUTER_MODEL).toBe("openrouter/free")
+  })
+
   it("заменяет частоты детерминированными фактами и отбрасывает неизвестные jobId", async () => {
     const fetcher = vi.fn(async (_input: Parameters<typeof fetch>[0], _init?: Parameters<typeof fetch>[1]) => responseWith(validReport))
     const report = await analyzeMarket(facts, { apiKey: "test", fetcher: fetcher as unknown as typeof fetch })
