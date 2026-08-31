@@ -6,7 +6,7 @@ import { logServerEvent, requestId as createRequestId } from "@/lib/observabilit
 import { analyzeMarket, OpenRouterAnalysisError } from "@/lib/openrouter/client"
 import { verifyTurnstile } from "@/lib/turnstile/verify"
 
-export const maxDuration = 60
+export const maxDuration = 150
 
 const MAX_BODY_BYTES = 40_000
 

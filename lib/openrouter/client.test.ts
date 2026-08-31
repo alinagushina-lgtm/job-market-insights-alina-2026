@@ -69,7 +69,11 @@ describe("analyzeMarket", () => {
     expect(report.matchScores).toHaveLength(1)
     const request = fetcher.mock.calls[0]?.[1]
     expect(request).toBeDefined()
-    expect(JSON.parse(String(request?.body))).toMatchObject({ model: OPENROUTER_MODEL, max_tokens: 2500 })
+    expect(JSON.parse(String(request?.body))).toMatchObject({
+      model: OPENROUTER_MODEL,
+      max_tokens: 2500,
+      reasoning: { effort: "none", exclude: true },
+    })
   })
 
   it("принимает JSON в markdown-блоке или после короткого вступления", async () => {

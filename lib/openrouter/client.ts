@@ -6,7 +6,7 @@ import { buildMarketPrompt } from "@/lib/openrouter/prompt"
 
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 export const OPENROUTER_MODEL = "openrouter/free"
-export const OPENROUTER_ATTEMPT_TIMEOUT_MS = 25_000
+export const OPENROUTER_ATTEMPT_TIMEOUT_MS = 60_000
 const MAX_ATTEMPTS = 2
 const RETRY_DELAY_MS = 500
 
@@ -106,6 +106,7 @@ async function requestReport(
       messages: [{ role: "user", content: buildMarketPrompt(facts) }],
       temperature: 0.2,
       max_tokens: 2500,
+      reasoning: { effort: "none", exclude: true },
       provider: { require_parameters: true },
       response_format: {
         type: "json_schema",
