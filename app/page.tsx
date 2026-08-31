@@ -19,7 +19,7 @@ export default async function Page() {
               поиск работы + разбор требований
             </p>
             <h1 className="mt-5 max-w-3xl text-balance text-4xl font-medium leading-[1.05] tracking-tight text-foreground lg:text-6xl">
-              Не список вакансий, а ответ: что учить, чтобы вас взяли
+              Ваш маршрут от поиска вакансий до нового навыка
             </h1>
             <p className="mt-6 max-w-xl text-pretty text-base leading-relaxed text-muted-foreground lg:text-lg">
               Ищем до 20 свежих вакансий за неделю, сравниваем требования с вашим профилем и предлагаем порядок действий.
